@@ -765,9 +765,334 @@ void analyze_memory_usage() {
     printf("Skip List: %zu KB (estimated)\n", skip_memory / 1024);
 }
 
+// =============================================================================
+// CORRECTNESS TESTING AND VALIDATION
+// =============================================================================
+
+typedef struct test_result {
+    int bid_levels;
+    int ask_levels;
+    uint64_t best_bid_price;
+    uint64_t best_ask_price;
+    uint64_t total_bid_quantity;
+    uint64_t total_ask_quantity;
+    uint64_t bid_price_checksum;  // Sum of all bid prices
+    uint64_t ask_price_checksum;  // Sum of all ask prices
+} test_result_t;
+
+// Extract results from simple book
+test_result_t extract_simple_book_results(simple_book_t* book) {
+    test_result_t result = {0};
+    
+    // Count bid levels and calculate metrics
+    price_level_t* current = book->bids;
+    while (current) {
+        result.bid_levels++;
+        if (result.bid_levels == 1) {
+            result.best_bid_price = current->price;
+        }
+        result.total_bid_quantity += current->total_quantity;
+        result.bid_price_checksum += current->price;
+        current = current->next;
+    }
+    
+    // Count ask levels and calculate metrics
+    current = book->asks;
+    while (current) {
+        result.ask_levels++;
+        if (result.ask_levels == 1) {
+            result.best_ask_price = current->price;
+        }
+        result.total_ask_quantity += current->total_quantity;
+        result.ask_price_checksum += current->price;
+        current = current->next;
+    }
+    
+    return result;
+}
+
+// Extract results from array book
+test_result_t extract_array_book_results(array_book_t* book) {
+    test_result_t result = {0};
+    
+    result.bid_levels = book->bid_count;
+    result.ask_levels = book->ask_count;
+    
+    if (book->bid_count > 0) {
+        result.best_bid_price = book->bids[0].price;
+    }
+    if (book->ask_count > 0) {
+        result.best_ask_price = book->asks[0].price;
+    }
+    
+    for (int i = 0; i < book->bid_count; i++) {
+        result.total_bid_quantity += book->bids[i].total_quantity;
+        result.bid_price_checksum += book->bids[i].price;
+    }
+    
+    for (int i = 0; i < book->ask_count; i++) {
+        result.total_ask_quantity += book->asks[i].total_quantity;
+        result.ask_price_checksum += book->asks[i].price;
+    }
+    
+    return result;
+}
+
+// Extract results from direct book
+test_result_t extract_direct_book_results(direct_book_t* book) {
+    test_result_t result = {0};
+    
+    // Find best bid (highest price with orders)
+    for (uint64_t price = book->bid_top; price > 0; price--) {
+        if (price >= PRICE_OFFSET) break;
+        direct_price_level_t* level = &book->bid_levels[PRICE_OFFSET - price];
+        if (level->order_count > 0) {
+            if (result.bid_levels == 0) {
+                result.best_bid_price = price;
+            }
+            result.bid_levels++;
+            result.total_bid_quantity += level->total_quantity;
+            result.bid_price_checksum += price;
+        }
+    }
+    
+    // Find best ask (lowest price with orders)
+    for (uint64_t price = book->ask_top; price < PRICE_RANGE; price++) {
+        direct_price_level_t* level = &book->ask_levels[price];
+        if (level->order_count > 0) {
+            if (result.ask_levels == 0) {
+                result.best_ask_price = price;
+            }
+            result.ask_levels++;
+            result.total_ask_quantity += level->total_quantity;
+            result.ask_price_checksum += price;
+        }
+    }
+    
+    return result;
+}
+
+// Compare two test results
+int compare_results(test_result_t* a, test_result_t* b, const char* name_a, const char* name_b) {
+    int passed = 1;
+    
+    if (a->bid_levels != b->bid_levels) {
+        printf("❌ FAIL: %s vs %s - Bid levels: %d vs %d\n", 
+               name_a, name_b, a->bid_levels, b->bid_levels);
+        passed = 0;
+    }
+    
+    if (a->ask_levels != b->ask_levels) {
+        printf("❌ FAIL: %s vs %s - Ask levels: %d vs %d\n", 
+               name_a, name_b, a->ask_levels, b->ask_levels);
+        passed = 0;
+    }
+    
+    if (a->best_bid_price != b->best_bid_price) {
+        printf("❌ FAIL: %s vs %s - Best bid: %lu vs %lu\n", 
+               name_a, name_b, a->best_bid_price, b->best_bid_price);
+        passed = 0;
+    }
+    
+    if (a->best_ask_price != b->best_ask_price) {
+        printf("❌ FAIL: %s vs %s - Best ask: %lu vs %lu\n", 
+               name_a, name_b, a->best_ask_price, b->best_ask_price);
+        passed = 0;
+    }
+    
+    if (a->total_bid_quantity != b->total_bid_quantity) {
+        printf("❌ FAIL: %s vs %s - Total bid qty: %lu vs %lu\n", 
+               name_a, name_b, a->total_bid_quantity, b->total_bid_quantity);
+        passed = 0;
+    }
+    
+    if (a->total_ask_quantity != b->total_ask_quantity) {
+        printf("❌ FAIL: %s vs %s - Total ask qty: %lu vs %lu\n", 
+               name_a, name_b, a->total_ask_quantity, b->total_ask_quantity);
+        passed = 0;
+    }
+    
+    if (a->bid_price_checksum != b->bid_price_checksum) {
+        printf("❌ FAIL: %s vs %s - Bid price checksum: %lu vs %lu\n", 
+               name_a, name_b, a->bid_price_checksum, b->bid_price_checksum);
+        passed = 0;
+    }
+    
+    if (a->ask_price_checksum != b->ask_price_checksum) {
+        printf("❌ FAIL: %s vs %s - Ask price checksum: %lu vs %lu\n", 
+               name_a, name_b, a->ask_price_checksum, b->ask_price_checksum);
+        passed = 0;
+    }
+    
+    return passed;
+}
+
+// Test SIMD correctness
+int test_simd_correctness() {
+    printf("\n=== SIMD CORRECTNESS TEST ===\n");
+    
+    const int TEST_SIZES[] = {1, 4, 7, 16, 100, 1000, 10007}; // Various sizes including edge cases
+    const int NUM_SIZES = sizeof(TEST_SIZES) / sizeof(TEST_SIZES[0]);
+    int all_passed = 1;
+    
+    for (int t = 0; t < NUM_SIZES; t++) {
+        int size = TEST_SIZES[t];
+        uint32_t* data = aligned_alloc(16, size * sizeof(uint32_t));
+        
+        // Fill with test pattern
+        for (int i = 0; i < size; i++) {
+            data[i] = (i * 7 + 13) % 1000; // Deterministic pattern
+        }
+        
+        uint64_t simd_result = simd_sum_quantities(data, size);
+        uint64_t generic_result = simd_sum_quantities_generic(data, size);
+        
+        if (simd_result != generic_result) {
+            printf("❌ SIMD FAIL (size %d): SIMD=%lu, Generic=%lu\n", 
+                   size, simd_result, generic_result);
+            all_passed = 0;
+        } else {
+            printf("✅ SIMD PASS (size %d): Both=%lu\n", size, simd_result);
+        }
+        
+        free(data);
+    }
+    
+    return all_passed;
+}
+
+// Comprehensive correctness test
+int run_correctness_tests() {
+    printf("\n=== COMPREHENSIVE CORRECTNESS TESTS ===\n");
+    
+    const int TEST_ORDER_COUNT = 5000;
+    const uint64_t BASE_PRICE = 50000;
+    
+    // Generate deterministic test data
+    benchmark_order_t* orders = malloc(TEST_ORDER_COUNT * sizeof(benchmark_order_t));
+    generate_orders(orders, TEST_ORDER_COUNT, BASE_PRICE);
+    
+    // Build simple book
+    printf("Building simple linked list book...\n");
+    simple_book_t simple_book = {0};
+    order_t* simple_orders = malloc(TEST_ORDER_COUNT * sizeof(order_t));
+    
+    for (int i = 0; i < TEST_ORDER_COUNT; i++) {
+        simple_orders[i].id = orders[i].id;
+        simple_orders[i].price = orders[i].price;
+        simple_orders[i].quantity = orders[i].quantity;
+        simple_orders[i].next = NULL;
+        simple_insert_order(&simple_book, &simple_orders[i], orders[i].is_bid);
+    }
+    
+    // Build array book
+    printf("Building array-based book...\n");
+    array_book_t array_book = {0};
+    for (int i = 0; i < TEST_ORDER_COUNT; i++) {
+        order_t order = {
+            .id = orders[i].id,
+            .price = orders[i].price,
+            .quantity = orders[i].quantity
+        };
+        array_insert_order(&array_book, &order, orders[i].is_bid);
+    }
+    
+    // Build direct book
+    printf("Building direct mapping book...\n");
+    direct_book_t direct_book = {0};
+    direct_book.bid_levels = calloc(PRICE_RANGE, sizeof(direct_price_level_t));
+    direct_book.ask_levels = calloc(PRICE_RANGE, sizeof(direct_price_level_t));
+    order_t* direct_orders = malloc(TEST_ORDER_COUNT * sizeof(order_t));
+    
+    int valid_orders = 0;
+    for (int i = 0; i < TEST_ORDER_COUNT; i++) {
+        direct_orders[i].id = orders[i].id;
+        direct_orders[i].price = orders[i].price;
+        direct_orders[i].quantity = orders[i].quantity;
+        
+        // Only add orders within valid price range
+        if ((orders[i].is_bid && orders[i].price < PRICE_OFFSET) ||
+            (!orders[i].is_bid && orders[i].price < PRICE_RANGE)) {
+            direct_insert_order(&direct_book, &direct_orders[i], orders[i].is_bid);
+            valid_orders++;
+        }
+    }
+    
+    printf("Added %d valid orders to direct book\n", valid_orders);
+    
+    // Extract results
+    test_result_t simple_result = extract_simple_book_results(&simple_book);
+    test_result_t array_result = extract_array_book_results(&array_book);
+    test_result_t direct_result = extract_direct_book_results(&direct_book);
+    
+    // Print summary
+    printf("\nRESULT SUMMARY:\n");
+    printf("%-15s %-10s %-10s %-12s %-12s %-15s %-15s\n", 
+           "Implementation", "BidLvls", "AskLvls", "BestBid", "BestAsk", "TotalBidQty", "TotalAskQty");
+    printf("%-15s %-10d %-10d %-12lu %-12lu %-15lu %-15lu\n", 
+           "Simple", simple_result.bid_levels, simple_result.ask_levels,
+           simple_result.best_bid_price, simple_result.best_ask_price,
+           simple_result.total_bid_quantity, simple_result.total_ask_quantity);
+    printf("%-15s %-10d %-10d %-12lu %-12lu %-15lu %-15lu\n", 
+           "Array", array_result.bid_levels, array_result.ask_levels,
+           array_result.best_bid_price, array_result.best_ask_price,
+           array_result.total_bid_quantity, array_result.total_ask_quantity);
+    printf("%-15s %-10d %-10d %-12lu %-12lu %-15lu %-15lu\n", 
+           "Direct", direct_result.bid_levels, direct_result.ask_levels,
+           direct_result.best_bid_price, direct_result.best_ask_price,
+           direct_result.total_bid_quantity, direct_result.total_ask_quantity);
+    
+    // Compare results
+    printf("\nCORRECTNESS COMPARISON:\n");
+    int test1 = compare_results(&simple_result, &array_result, "Simple", "Array");
+    int test2 = compare_results(&simple_result, &direct_result, "Simple", "Direct");
+    int test3 = test_simd_correctness();
+    
+    int all_passed = test1 && test2 && test3;
+    
+    if (all_passed) {
+        printf("\n🎉 ALL CORRECTNESS TESTS PASSED! 🎉\n");
+        printf("All implementations produce identical results.\n");
+    } else {
+        printf("\n💥 CORRECTNESS TESTS FAILED! 💥\n");
+        printf("Some implementations have bugs - performance results may be invalid.\n");
+    }
+    
+    // Cleanup
+    price_level_t* current = simple_book.bids;
+    while (current) {
+        price_level_t* next = current->next;
+        free(current);
+        current = next;
+    }
+    current = simple_book.asks;
+    while (current) {
+        price_level_t* next = current->next;
+        free(current);
+        current = next;
+    }
+    
+    free(orders);
+    free(simple_orders);
+    free(direct_book.bid_levels);
+    free(direct_book.ask_levels);
+    free(direct_orders);
+    
+    return all_passed;
+}
 // Main benchmark runner
 void run_comprehensive_benchmark() {
-    printf("=== COMPREHENSIVE ORDER BOOK BENCHMARK ===\n\n");
+    // First run correctness tests
+    printf("=== STARTING COMPREHENSIVE BENCHMARK ===\n");
+    printf("Step 1: Verifying correctness of all implementations...\n");
+    
+    if (!run_correctness_tests()) {
+        printf("\n🚨 ABORTING BENCHMARK - CORRECTNESS TESTS FAILED! 🚨\n");
+        printf("Fix implementation bugs before running performance tests.\n");
+        return;
+    }
+    
+    printf("\n=== PERFORMANCE BENCHMARK (CORRECTNESS VERIFIED) ===\n\n");
     
     const int ORDER_COUNTS[] = {1000, 5000, 10000, 25000};
     const int NUM_TESTS = sizeof(ORDER_COUNTS) / sizeof(ORDER_COUNTS[0]);
